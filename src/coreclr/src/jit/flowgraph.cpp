@@ -176,12 +176,41 @@ void Compiler::fgInit()
     fgPreviousCandidateSIMDFieldAsgStmt = nullptr;
 #endif
 
-    fgHasSwitch = false;
+    fgHasSwitch   = false;
+    fgBlockCounts = nullptr;
 }
 
+//------------------------------------------------------------------------
+// fgHaveProfileData: check if profile data is available
+//
+// Returns:
+//   true if so
+//
+// Note:
+//   This now returns true for inlinees. We might consider preserving the
+//   old behavior for crossgen, since crossgen BBINSTRs still do inlining
+//   and don't instrument the inlinees.
+//
+//   Thus if BBINSTR and BBOPT do the same inlines (which can happen)
+//   profile data for an inlinee (if available) will not fully reflect
+//   the behavior of the inlinee when called from this method.
+//
+//   If this inlinee was not inlined by the BBINSTR run then the
+//   profile data for the inlinee will reflect this method's influence.
+//
+//   * for ALWAYS_INLINE and FORCE_INLINE cases it is unlikely we'll find
+//     any profile data, as BBINSTR and BBOPT callers will both inline;
+//     only indirect callers will invoke the instrumented version to run.
+//   * for DISCRETIONARY_INLINE cases we may or may not find relevant
+//     data, depending, but chances are the data is relevant.
+//
+//  TieredPGO data comes from Tier0 methods, which currently do not do
+//  any inlining; thus inlinee profile data should be available and
+//  representative.
+//
 bool Compiler::fgHaveProfileData()
 {
-    if (compIsForInlining() || compIsForImportOnly())
+    if (compIsForImportOnly())
     {
         return false;
     }
@@ -189,6 +218,111 @@ bool Compiler::fgHaveProfileData()
     return (fgBlockCounts != nullptr);
 }
 
+//------------------------------------------------------------------------
+// fgComputeProfileScale: determine how much scaling to apply
+//   to raw profile count data.
+//
+// Notes:
+//   Scaling is only needed for inlinees, and the results of this
+//   computation are recorded in fields of impInlineInfo.
+//
+void Compiler::fgComputeProfileScale()
+{
+    // Only applicable to inlinees
+    assert(compIsForInlining());
+
+    // Have we already determined the scale?
+    if (impInlineInfo->profileScaleState != InlineInfo::ProfileScaleState::UNDETERMINED)
+    {
+        return;
+    }
+
+    // No, not yet -- try and compute the scale.
+    JITDUMP("Computing inlinee profile scale:\n");
+
+    // Call site has profile weight?
+    //
+    // Todo: handle case of unprofiled caller invoking profiled callee.
+    //
+    const BasicBlock* callSiteBlock = impInlineInfo->iciBlock;
+    if (!callSiteBlock->hasProfileWeight())
+    {
+        JITDUMP("   ... call site not profiled\n");
+        impInlineInfo->profileScaleState = InlineInfo::ProfileScaleState::UNAVAILABLE;
+        return;
+    }
+
+    const BasicBlock::weight_t callSiteWeight = callSiteBlock->bbWeight;
+
+    // Call site has zero count?
+    //
+    // Todo: perhaps retain some semblance of callee profile data,
+    // possibly scaled down severely.
+    //
+    if (callSiteWeight == 0)
+    {
+        JITDUMP("   ... zero call site count\n");
+        impInlineInfo->profileScaleState = InlineInfo::ProfileScaleState::UNAVAILABLE;
+        return;
+    }
+
+    // Callee has profile data?
+    //
+    if (!fgHaveProfileData())
+    {
+        JITDUMP("   ... no callee profile data\n");
+        impInlineInfo->profileScaleState = InlineInfo::ProfileScaleState::UNAVAILABLE;
+        return;
+    }
+
+    // Find callee's unscaled entry weight.
+    //
+    // Ostensibly this should be fgCalledCount for the callee, but that's not available
+    // as it requires some analysis.
+    //
+    // For most callees it will be the same as the entry block count.
+    //
+    BasicBlock::weight_t calleeWeight = 0;
+
+    if (!fgGetProfileWeightForBasicBlock(0, &calleeWeight))
+    {
+        JITDUMP("   ... no callee profile data for entry block\n");
+        impInlineInfo->profileScaleState = InlineInfo::ProfileScaleState::UNAVAILABLE;
+        return;
+    }
+
+    // We should generally be able to assume calleeWeight >= callSiteWeight.
+    // If this isn't so, perhaps something is wrong with the profile data
+    // collection or retrieval.
+    //
+    // For now, ignore callee data if we'd need to upscale.
+    //
+    if (calleeWeight < callSiteWeight)
+    {
+        JITDUMP("   ... callee entry count %d is less than call site count %d\n", calleeWeight, callSiteWeight);
+        impInlineInfo->profileScaleState = InlineInfo::ProfileScaleState::UNAVAILABLE;
+        return;
+    }
+
+    // Hence, scale is always in the range (0.0...1.0] -- we are always scaling down callee counts.
+    //
+    const double scale                = ((double)callSiteWeight) / calleeWeight;
+    impInlineInfo->profileScaleFactor = scale;
+    impInlineInfo->profileScaleState  = InlineInfo::ProfileScaleState::KNOWN;
+
+    JITDUMP("   call site count %u callee entry count %u scale %f\n", callSiteWeight, calleeWeight, scale);
+}
+
+//------------------------------------------------------------------------
+// fgGetProfileWeightForBasicBlock: obtain profile data for a block
+//
+// Arguments:
+//   offset       - IL offset of the block
+//   weightWB     - [OUT] weight obtained
+//
+// Returns:
+//   true if data was found
+//
 bool Compiler::fgGetProfileWeightForBasicBlock(IL_OFFSET offset, unsigned* weightWB)
 {
     noway_assert(weightWB != nullptr);
@@ -229,19 +363,16 @@ bool Compiler::fgGetProfileWeightForBasicBlock(IL_OFFSET offset, unsigned* weigh
     }
 #endif // DEBUG
 
-    if (fgHaveProfileData() == false)
+    if (!fgHaveProfileData())
     {
         return false;
     }
 
-    noway_assert(!compIsForInlining());
     for (UINT32 i = 0; i < fgBlockCountsCount; i++)
     {
         if (fgBlockCounts[i].ILOffset == offset)
         {
-            weight = fgBlockCounts[i].ExecutionCount;
-
-            *weightWB = weight;
+            *weightWB = fgBlockCounts[i].ExecutionCount;
             return true;
         }
     }
@@ -3563,6 +3694,49 @@ void Compiler::fgInitBlockVarSets()
     fgBBVarSetsInited = true;
 }
 
+//------------------------------------------------------------------------
+// blockNeedsGCPoll: Determine whether the block needs GC poll inserted
+//
+// Arguments:
+//   block         - the block to check
+//
+// Notes:
+//    The GC poll may not be required because of optimizations applied earlier
+//    or because of GC poll done implicitly by regular unmanaged calls.
+//
+// Returns:
+//    Whether the GC poll needs to be inserted after the block
+//
+static bool blockNeedsGCPoll(BasicBlock* block)
+{
+    bool blockMayNeedGCPoll = false;
+    for (Statement* stmt = block->FirstNonPhiDef(); stmt != nullptr; stmt = stmt->GetNextStmt())
+    {
+        if ((stmt->GetRootNode()->gtFlags & GTF_CALL) != 0)
+        {
+            for (GenTree* tree = stmt->GetTreeList(); tree != nullptr; tree = tree->gtNext)
+            {
+                if (tree->OperGet() == GT_CALL)
+                {
+                    GenTreeCall* call = tree->AsCall();
+                    if (call->IsUnmanaged())
+                    {
+                        if (!call->IsSuppressGCTransition())
+                        {
+                            // If the block contains regular unmanaged call, we can depend on it
+                            // to poll for GC. No need to scan further.
+                            return false;
+                        }
+
+                        blockMayNeedGCPoll = true;
+                    }
+                }
+            }
+        }
+    }
+    return blockMayNeedGCPoll;
+}
+
 //------------------------------------------------------------------------------
 // fgInsertGCPolls : Insert GC polls for basic blocks containing calls to methods
 //                   with SuppressGCTransitionAttribute.
@@ -3571,6 +3745,9 @@ void Compiler::fgInitBlockVarSets()
 //    When not optimizing, the method relies on BBF_HAS_SUPPRESSGC_CALL flag to
 //    find the basic blocks that require GC polls; when optimizing the tree nodes
 //    are scanned to find calls to methods with SuppressGCTransitionAttribute.
+//
+//    This must be done after any transformations that would add control flow between
+//    calls.
 //
 // Returns:
 //    PhaseStatus indicating what, if anything, was changed.
@@ -3598,43 +3775,12 @@ PhaseStatus Compiler::fgInsertGCPolls()
 
     BasicBlock* block;
 
-    // Walk through the blocks and hunt for a block that has needs a GC Poll
+    // Walk through the blocks and hunt for a block that needs a GC Poll
     for (block = fgFirstBB; block; block = block->bbNext)
     {
-        bool blockNeedsGCPoll = false;
-        if (opts.OptimizationDisabled())
-        {
-            if ((block->bbFlags & BBF_HAS_SUPPRESSGC_CALL) != 0)
-            {
-                blockNeedsGCPoll = true;
-            }
-        }
-        else
-        {
-            // When optimizations are enabled, we can't rely on BBF_HAS_SUPPRESSGC_CALL flag:
-            // the call could've been moved, e.g., hoisted from a loop, CSE'd, etc.
-            for (Statement* stmt = block->FirstNonPhiDef(); !blockNeedsGCPoll && (stmt != nullptr);
-                 stmt            = stmt->GetNextStmt())
-            {
-                if ((stmt->GetRootNode()->gtFlags & GTF_CALL) != 0)
-                {
-                    for (GenTree* tree = stmt->GetTreeList(); !blockNeedsGCPoll && (tree != nullptr);
-                         tree          = tree->gtNext)
-                    {
-                        if (tree->OperGet() == GT_CALL)
-                        {
-                            GenTreeCall* call = tree->AsCall();
-                            if (call->IsUnmanaged() && call->IsSuppressGCTransition())
-                            {
-                                blockNeedsGCPoll = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!blockNeedsGCPoll)
+        // When optimizations are enabled, we can't rely on BBF_HAS_SUPPRESSGC_CALL flag:
+        // the call could've been moved, e.g., hoisted from a loop, CSE'd, etc.
+        if (opts.OptimizationDisabled() ? ((block->bbFlags & BBF_HAS_SUPPRESSGC_CALL) == 0) : !blockNeedsGCPoll(block))
         {
             continue;
         }
@@ -5606,6 +5752,11 @@ unsigned Compiler::fgMakeBasicBlocks(const BYTE* codeAddr, IL_OFFSET codeSize, F
         }
     }
 
+    if (compIsForInlining())
+    {
+        fgComputeProfileScale();
+    }
+
     do
     {
         unsigned   jmpAddr = DUMMY_INIT(BAD_IL_OFFSET);
@@ -6028,9 +6179,19 @@ unsigned Compiler::fgMakeBasicBlocks(const BYTE* codeAddr, IL_OFFSET codeSize, F
         curBBdesc->bbCodeOffsEnd = nxtBBoffs;
 
         unsigned profileWeight;
+
         if (fgGetProfileWeightForBasicBlock(curBBoffs, &profileWeight))
         {
+            if (compIsForInlining())
+            {
+                if (impInlineInfo->profileScaleState == InlineInfo::ProfileScaleState::KNOWN)
+                {
+                    profileWeight = (unsigned)(impInlineInfo->profileScaleFactor * profileWeight);
+                }
+            }
+
             curBBdesc->setBBProfileWeight(profileWeight);
+
             if (profileWeight == 0)
             {
                 curBBdesc->bbSetRunRarely();
@@ -7167,7 +7328,7 @@ unsigned Compiler::fgGetNestingLevel(BasicBlock* block, unsigned* pFinallyNestin
 }
 
 //------------------------------------------------------------------------
-// fgImport: read the IL forf the method and create jit IR
+// fgImport: read the IL for the method and create jit IR
 //
 // Returns:
 //    phase status
@@ -7401,6 +7562,7 @@ GenTreeCall* Compiler::fgGetStaticsCCtorHelper(CORINFO_CLASS_HANDLE cls, CorInfo
         case CORINFO_HELP_GETSHARED_NONGCSTATIC_BASE_DYNAMICCLASS:
         case CORINFO_HELP_GETSHARED_GCTHREADSTATIC_BASE:
         case CORINFO_HELP_GETSHARED_GCTHREADSTATIC_BASE_DYNAMICCLASS:
+        case CORINFO_HELP_GETSHARED_NONGCTHREADSTATIC_BASE_DYNAMICCLASS:
             // type = TYP_BYREF;
             break;
 
@@ -7414,7 +7576,6 @@ GenTreeCall* Compiler::fgGetStaticsCCtorHelper(CORINFO_CLASS_HANDLE cls, CorInfo
 
         case CORINFO_HELP_GETSHARED_NONGCSTATIC_BASE:
         case CORINFO_HELP_GETSHARED_NONGCTHREADSTATIC_BASE:
-        case CORINFO_HELP_GETSHARED_NONGCTHREADSTATIC_BASE_DYNAMICCLASS:
         case CORINFO_HELP_CLASSINIT_SHARED_DYNAMICCLASS:
             type = TYP_I_IMPL;
             break;
@@ -14704,9 +14865,9 @@ bool Compiler::fgOptimizeSwitchBranches(BasicBlock* block)
             LIR::ReadOnlyRange range(zeroConstNode, switchTree);
             m_pLowering->LowerRange(block, range);
         }
-        else
+        else if (fgStmtListThreaded)
         {
-            // Re-link the nodes for this statement.
+            gtSetStmtInfo(switchStmt);
             fgSetStmtSeq(switchStmt);
         }
 
@@ -21608,6 +21769,10 @@ void Compiler::fgDebugCheckFlags(GenTree* tree)
                 chkFlags |= GTF_GLOB_REF | GTF_ASG;
                 break;
 
+            case GT_LCL_VAR:
+                assert((tree->gtFlags & GTF_VAR_FOLDED_IND) == 0);
+                break;
+
             default:
                 break;
         }
@@ -23210,6 +23375,8 @@ void Compiler::fgInvokeInlineeCompiler(GenTreeCall* call, InlineResult* inlineRe
     inlineInfo.retExprClassHnd        = nullptr;
     inlineInfo.retExprClassHndIsExact = false;
     inlineInfo.inlineResult           = inlineResult;
+    inlineInfo.profileScaleState      = InlineInfo::ProfileScaleState::UNDETERMINED;
+    inlineInfo.profileScaleFactor     = 0.0;
 #ifdef FEATURE_SIMD
     inlineInfo.hasSIMDTypeArgLocalOrReturn = false;
 #endif // FEATURE_SIMD
@@ -23283,7 +23450,6 @@ void Compiler::fgInvokeInlineeCompiler(GenTreeCall* call, InlineResult* inlineRe
 
                 // The following flags are lost when inlining.
                 // (This is checked in Compiler::compInitOptions().)
-                compileFlagsForInlinee.Clear(JitFlags::JIT_FLAG_BBOPT);
                 compileFlagsForInlinee.Clear(JitFlags::JIT_FLAG_BBINSTR);
                 compileFlagsForInlinee.Clear(JitFlags::JIT_FLAG_PROF_ENTERLEAVE);
                 compileFlagsForInlinee.Clear(JitFlags::JIT_FLAG_DEBUG_EnC);
@@ -23489,7 +23655,9 @@ void Compiler::fgInsertInlineeBlocks(InlineInfo* pInlineInfo)
             const unsigned __int64 inlineeBlockFlags = InlineeCompiler->fgFirstBB->bbFlags;
             noway_assert((inlineeBlockFlags & BBF_HAS_JMP) == 0);
             noway_assert((inlineeBlockFlags & BBF_KEEP_BBJ_ALWAYS) == 0);
-            iciBlock->bbFlags |= inlineeBlockFlags;
+
+            // Todo: we may want to exclude other flags here.
+            iciBlock->bbFlags |= (inlineeBlockFlags & ~BBF_RUN_RARELY);
 
 #ifdef DEBUG
             if (verbose)
@@ -23648,6 +23816,13 @@ void Compiler::fgInsertInlineeBlocks(InlineInfo* pInlineInfo)
                 block->bbJumpKind = BBJ_NONE;
             }
         }
+
+        // Update profile weight for callee blocks, if we didn't do it already.
+        if (pInlineInfo->profileScaleState == InlineInfo::ProfileScaleState::KNOWN)
+        {
+            continue;
+        }
+
         if (inheritWeight)
         {
             block->inheritWeight(iciBlock);
@@ -24881,7 +25056,7 @@ PhaseStatus Compiler::fgRemoveEmptyTry()
                 GenTree* expr = stmt->GetRootNode();
                 if (expr->gtOper == GT_END_LFIN)
                 {
-                    const unsigned nestLevel = expr->AsVal()->gtVal1;
+                    const size_t nestLevel = expr->AsVal()->gtVal1;
                     assert(nestLevel > 0);
                     expr->AsVal()->gtVal1 = nestLevel - 1;
                 }

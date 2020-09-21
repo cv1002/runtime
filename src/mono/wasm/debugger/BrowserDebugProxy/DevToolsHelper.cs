@@ -27,13 +27,13 @@ namespace Microsoft.WebAssembly.Diagnostics
         // hashset treats 0 as unset
         public override int GetHashCode() => sessionId?.GetHashCode() ?? -1;
 
-        public override bool Equals(object obj) => (obj is SessionId) ? ((SessionId) obj).sessionId == sessionId : false;
+        public override bool Equals(object obj) => (obj is SessionId) ? ((SessionId)obj).sessionId == sessionId : false;
 
         public static bool operator ==(SessionId a, SessionId b) => a.sessionId == b.sessionId;
 
         public static bool operator !=(SessionId a, SessionId b) => a.sessionId != b.sessionId;
 
-        public static SessionId Null { get; } = new SessionId();
+        public static SessionId Null { get; }
 
         public override string ToString() => $"session-{sessionId}";
     }
@@ -55,7 +55,7 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public override int GetHashCode() => (sessionId?.GetHashCode() ?? 0) ^ id.GetHashCode();
 
-        public override bool Equals(object obj) => (obj is MessageId) ? ((MessageId) obj).sessionId == sessionId && ((MessageId) obj).id == id : false;
+        public override bool Equals(object obj) => (obj is MessageId) ? ((MessageId)obj).sessionId == sessionId && ((MessageId)obj).id == id : false;
     }
 
     internal class DotnetObjectId
@@ -74,7 +74,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             if (!id.StartsWith("dotnet:"))
                 return false;
 
-            var parts = id.Split(":", 3);
+            string[] parts = id.Split(":", 3);
 
             if (parts.Length < 3)
                 return false;
@@ -101,12 +101,12 @@ namespace Microsoft.WebAssembly.Diagnostics
         public bool IsOk => Value != null;
         public bool IsErr => Error != null;
 
-        Result(JObject result, JObject error)
+        private Result(JObject result, JObject error)
         {
             if (result != null && error != null)
                 throw new ArgumentException($"Both {nameof(result)} and {nameof(error)} arguments cannot be non-null.");
 
-            bool resultHasError = String.Compare((result?["result"] as JObject) ? ["subtype"]?.Value<string>(), "error") == 0;
+            bool resultHasError = string.Compare((result?["result"] as JObject)?["subtype"]?.Value<string>(), "error") == 0;
             if (result != null && resultHasError)
             {
                 this.Value = null;
@@ -142,8 +142,8 @@ namespace Microsoft.WebAssembly.Diagnostics
                 return JObject.FromObject(new
                 {
                     target.id,
-                        target.sessionId,
-                        result = Value
+                    target.sessionId,
+                    result = Value
                 });
             }
             else
@@ -151,15 +151,15 @@ namespace Microsoft.WebAssembly.Diagnostics
                 return JObject.FromObject(new
                 {
                     target.id,
-                        target.sessionId,
-                        error = Error
+                    target.sessionId,
+                    error = Error
                 });
             }
         }
 
         public override string ToString()
         {
-            return $"[Result: IsOk: {IsOk}, IsErr: {IsErr}, Value: {Value?.ToString ()}, Error: {Error?.ToString ()} ]";
+            return $"[Result: IsOk: {IsOk}, IsErr: {IsErr}, Value: {Value?.ToString()}, Error: {Error?.ToString()} ]";
         }
     }
 
@@ -167,13 +167,15 @@ namespace Microsoft.WebAssembly.Diagnostics
     {
         public string expression { get; set; }
         public string objectGroup { get; set; } = "mono-debugger";
-        public bool includeCommandLineAPI { get; set; } = false;
-        public bool silent { get; set; } = false;
+        public bool includeCommandLineAPI { get; set; }
+        public bool silent { get; set; }
         public bool returnByValue { get; set; } = true;
 
         public MonoCommands(string expression) => this.expression = expression;
 
         public static MonoCommands GetCallStack() => new MonoCommands("MONO.mono_wasm_get_call_stack()");
+
+        public static MonoCommands GetExceptionObject() => new MonoCommands("MONO.mono_wasm_get_exception_object()");
 
         public static MonoCommands IsRuntimeReady() => new MonoCommands("MONO.mono_wasm_runtime_is_ready");
 
@@ -188,7 +190,13 @@ namespace Microsoft.WebAssembly.Diagnostics
         public static MonoCommands GetScopeVariables(int scopeId, params VarInfo[] vars)
         {
             var var_ids = vars.Select(v => new { index = v.Index, name = v.Name }).ToArray();
-            return new MonoCommands($"MONO.mono_wasm_get_variables({scopeId}, {JsonConvert.SerializeObject (var_ids)})");
+            return new MonoCommands($"MONO.mono_wasm_get_variables({scopeId}, {JsonConvert.SerializeObject(var_ids)})");
+        }
+
+        public static MonoCommands EvaluateMemberAccess(int scopeId, string expr, params VarInfo[] vars)
+        {
+            var var_ids = vars.Select(v => new { index = v.Index, name = v.Name }).ToArray();
+            return new MonoCommands($"MONO.mono_wasm_eval_member_access({scopeId}, {JsonConvert.SerializeObject(var_ids)}, '', '{expr}')");
         }
 
         public static MonoCommands SetBreakpoint(string assemblyName, uint methodToken, int ilOffset) => new MonoCommands($"MONO.mono_wasm_set_breakpoint (\"{assemblyName}\", {methodToken}, {ilOffset})");
@@ -197,9 +205,11 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public static MonoCommands ReleaseObject(DotnetObjectId objectId) => new MonoCommands($"MONO.mono_wasm_release_object('{objectId}')");
 
-        public static MonoCommands CallFunctionOn(JToken args) => new MonoCommands($"MONO.mono_wasm_call_function_on ({args.ToString ()})");
+        public static MonoCommands CallFunctionOn(JToken args) => new MonoCommands($"MONO.mono_wasm_call_function_on ({args.ToString()})");
 
         public static MonoCommands Resume() => new MonoCommands($"MONO.mono_wasm_debugger_resume ()");
+
+        public static MonoCommands SetPauseOnExceptions(string state) => new MonoCommands($"MONO.mono_wasm_set_pause_on_exceptions(\"{state}\")");
     }
 
     internal enum MonoErrorCodes
@@ -210,9 +220,10 @@ namespace Microsoft.WebAssembly.Diagnostics
     internal class MonoConstants
     {
         public const string RUNTIME_IS_READY = "mono_wasm_runtime_ready";
+        public const string EVENT_RAISED = "mono_wasm_debug_event_raised:aef14bca-5519-4dfe-b35a-f867abc123ae";
     }
 
-    class Frame
+    internal class Frame
     {
         public Frame(MethodInfo method, SourceLocation location, int id)
         {
@@ -226,7 +237,7 @@ namespace Microsoft.WebAssembly.Diagnostics
         public int Id { get; private set; }
     }
 
-    class Breakpoint
+    internal class Breakpoint
     {
         public SourceLocation Location { get; private set; }
         public int RemoteId { get; set; }
@@ -250,14 +261,14 @@ namespace Microsoft.WebAssembly.Diagnostics
         }
     }
 
-    enum BreakpointState
+    internal enum BreakpointState
     {
         Active,
         Disabled,
         Pending
     }
 
-    enum StepKind
+    internal enum StepKind
     {
         Into,
         Out,
@@ -269,7 +280,7 @@ namespace Microsoft.WebAssembly.Diagnostics
         public string DebuggerId { get; set; }
         public Dictionary<string, BreakpointRequest> BreakpointRequests { get; } = new Dictionary<string, BreakpointRequest>();
 
-        public TaskCompletionSource<DebugStore> ready = null;
+        public TaskCompletionSource<DebugStore> ready;
         public bool IsRuntimeReady => ready != null && ready.Task.IsCompleted;
 
         public int Id { get; set; }
@@ -281,7 +292,7 @@ namespace Microsoft.WebAssembly.Diagnostics
         internal DebugStore store;
         public TaskCompletionSource<DebugStore> Source { get; } = new TaskCompletionSource<DebugStore>();
 
-        public Dictionary<string, JToken> LocalsCache = new Dictionary<string, JToken>();
+        private Dictionary<int, PerScopeCache> perScopeCaches { get; } = new Dictionary<int, PerScopeCache>();
 
         public DebugStore Store
         {
@@ -294,11 +305,26 @@ namespace Microsoft.WebAssembly.Diagnostics
             }
         }
 
+        public PerScopeCache GetCacheForScope(int scope_id)
+        {
+            if (perScopeCaches.TryGetValue(scope_id, out PerScopeCache cache))
+                return cache;
+
+            cache = new PerScopeCache();
+            perScopeCaches[scope_id] = cache;
+            return cache;
+        }
+
         public void ClearState()
         {
             CallStack = null;
-            LocalsCache.Clear();
+            perScopeCaches.Clear();
         }
+    }
 
+    internal class PerScopeCache
+    {
+        public Dictionary<string, JObject> Locals { get; } = new Dictionary<string, JObject>();
+        public Dictionary<string, JObject> MemberReferences { get; } = new Dictionary<string, JObject>();
     }
 }

@@ -585,7 +585,7 @@ GenTree* Lowering::LowerSwitch(GenTree* node)
     // I think this is due to the fact that we use absolute addressing
     // instead of relative. But in CoreRT is used as a rule relative
     // addressing when we generate an executable.
-    // See also https://github.com/dotnet/coreclr/issues/13194
+    // See also https://github.com/dotnet/runtime/issues/8683
     // Also https://github.com/dotnet/coreclr/pull/13197
     useJumpSequence = useJumpSequence || comp->IsTargetAbi(CORINFO_CORERT_ABI);
 #endif // defined(TARGET_UNIX) && defined(TARGET_ARM)
@@ -2991,7 +2991,7 @@ void Lowering::LowerRet(GenTreeUnOp* ret)
             ReturnTypeDesc retTypeDesc;
             LclVarDsc*     varDsc = nullptr;
             varDsc                = comp->lvaGetDesc(retVal->AsLclVar()->GetLclNum());
-            retTypeDesc.InitializeStructReturnType(comp, varDsc->lvVerTypeInfo.GetClassHandle());
+            retTypeDesc.InitializeStructReturnType(comp, varDsc->GetStructHnd());
             if (retTypeDesc.GetReturnRegCount() > 1)
             {
                 CheckMultiRegLclVar(retVal->AsLclVar(), &retTypeDesc);

@@ -27,16 +27,26 @@ public class WasmAppBuilder : Task
     public string? MainAssembly { get; set; }
     [Required]
     public string? MainJS { get; set; }
+
+    // If true, continue when a referenced assembly cannot be found.
+    // If false, throw an exception.
+    public bool SkipMissingAssemblies { get; set; }
+
+    // full list of ICU data files we produce can be found here:
+    // https://github.com/dotnet/icu/tree/maint/maint-67/icu-filters
+    public string? IcuDataFileName { get; set; } = "icudt.dat";
+
     [Required]
     public ITaskItem[]? AssemblySearchPaths { get; set; }
     public int DebugLevel { get; set; }
     public ITaskItem[]? ExtraAssemblies { get; set; }
+    public ITaskItem[]? SatelliteAssemblies { get; set; }
     public ITaskItem[]? FilesToIncludeInFileSystem { get; set; }
     public ITaskItem[]? RemoteSources { get; set; }
     public bool InvariantGlobalization { get; set; }
 
-    SortedDictionary<string, Assembly>? _assemblies;
-    Resolver? _resolver;
+    private SortedDictionary<string, Assembly>? _assemblies;
+    private Resolver? _resolver;
 
     private class WasmAppConfig
     {
@@ -67,6 +77,17 @@ public class WasmAppBuilder : Task
         public AssemblyEntry(string name) : base(name, "assembly") {}
     }
 
+    private class SatelliteAssemblyEntry : AssetEntry
+    {
+        public SatelliteAssemblyEntry(string name, string culture) : base(name, "resource")
+        {
+            CultureName = culture;
+        }
+
+        [JsonPropertyName("culture")]
+        public string CultureName { get; set; }
+    }
+
     private class VfsEntry : AssetEntry {
         public VfsEntry(string name) : base(name, "vfs") {}
         [JsonPropertyName("virtual_path")]
@@ -74,7 +95,7 @@ public class WasmAppBuilder : Task
     }
 
     private class IcuData : AssetEntry {
-        public IcuData(string name = "icudt.dat") : base(name, "icu") {}
+        public IcuData(string name) : base(name, "icu") {}
         [JsonPropertyName("load_remote")]
         public bool LoadRemote { get; set; }
     }
@@ -85,6 +106,8 @@ public class WasmAppBuilder : Task
             throw new ArgumentException($"File MainAssembly='{MainAssembly}' doesn't exist.");
         if (!File.Exists(MainJS))
             throw new ArgumentException($"File MainJS='{MainJS}' doesn't exist.");
+        if (!InvariantGlobalization && string.IsNullOrEmpty(IcuDataFileName))
+            throw new ArgumentException("IcuDataFileName property shouldn't be empty if InvariantGlobalization=false");
 
         var paths = new List<string>();
         _assemblies = new SortedDictionary<string, Assembly>();
@@ -107,8 +130,18 @@ public class WasmAppBuilder : Task
         {
             foreach (var item in ExtraAssemblies)
             {
-                var refAssembly = mlc.LoadFromAssemblyPath(item.ItemSpec);
-                Add(mlc, refAssembly);
+                try
+                {
+                    var refAssembly = mlc.LoadFromAssemblyPath(item.ItemSpec);
+                    Add(mlc, refAssembly);
+                }
+                catch (System.IO.FileLoadException)
+                {
+                    if (!SkipMissingAssemblies)
+                    {
+                        throw;
+                    }
+                }
             }
         }
 
@@ -130,25 +163,40 @@ public class WasmAppBuilder : Task
         List<string> nativeAssets = new List<string>() { "dotnet.wasm", "dotnet.js", "dotnet.timezones.blat" };
 
         if (!InvariantGlobalization)
-        {
-            nativeAssets.Add("icudt.dat");
-        }
+            nativeAssets.Add(IcuDataFileName!);
 
         foreach (var f in nativeAssets)
             File.Copy(Path.Join (MicrosoftNetCoreAppRuntimePackDir, "native", f), Path.Join(AppDir, f), true);
         File.Copy(MainJS!, Path.Join(AppDir, "runtime.js"),  true);
 
+        var html = @"<html><body><script type=""text/javascript"" src=""runtime.js""></script></body></html>";
+        File.WriteAllText(Path.Join(AppDir, "index.html"), html);
+
         foreach (var assembly in _assemblies.Values) {
-            config.Assets.Add(new AssemblyEntry (Path.GetFileName(assembly.Location)));
+            config.Assets.Add(new AssemblyEntry(Path.GetFileName(assembly.Location)));
             if (DebugLevel > 0) {
                 var pdb = assembly.Location;
                 pdb = Path.ChangeExtension(pdb, ".pdb");
                 if (File.Exists(pdb))
-                    config.Assets.Add(new AssemblyEntry (Path.GetFileName(pdb)));
+                    config.Assets.Add(new AssemblyEntry(Path.GetFileName(pdb)));
             }
         }
 
         config.DebugLevel = DebugLevel;
+
+        if (SatelliteAssemblies != null)
+        {
+            foreach (var assembly in SatelliteAssemblies)
+            {
+                string culture = assembly.GetMetadata("CultureName") ?? string.Empty;
+                string fullPath = assembly.GetMetadata("Identity");
+                string name = Path.GetFileName(fullPath);
+                string directory = Path.Join(AppDir, config.AssemblyRoot, culture);
+                Directory.CreateDirectory(directory);
+                File.Copy(fullPath, Path.Join(directory, name), true);
+                config.Assets.Add(new SatelliteAssemblyEntry(name, culture));
+            }
+        }
 
         if (FilesToIncludeInFileSystem != null)
         {
@@ -179,8 +227,8 @@ public class WasmAppBuilder : Task
         }
 
         if (!InvariantGlobalization)
-            config.Assets.Add(new IcuData { LoadRemote = RemoteSources?.Length > 0 });
-            
+            config.Assets.Add(new IcuData(IcuDataFileName!) { LoadRemote = RemoteSources?.Length > 0 });
+
         config.Assets.Add(new VfsEntry ("dotnet.timezones.blat") { VirtualPath = "/usr/share/zoneinfo/"});
 
         if (RemoteSources?.Length > 0) {
@@ -222,9 +270,9 @@ public class WasmAppBuilder : Task
     }
 }
 
-class Resolver : MetadataAssemblyResolver
+internal class Resolver : MetadataAssemblyResolver
 {
-    List<String> _searchPaths;
+    private List<string> _searchPaths;
 
     public Resolver(List<string> searchPaths)
     {
